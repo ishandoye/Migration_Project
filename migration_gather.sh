@@ -3,7 +3,7 @@
  ############################################################################
  # Bash script to gather details for Migration Purpose
  # Author: Team L1
- # Team L1 - Navdeep(Captain), Rohit Varshney, Ashok Kumar, Yogendra Modak, Gaurav Kumar, Godishala Rajkumar, Ishan Doye
+ # Team L1 - Ishan Doye(Captain), Navdeep
  # Functions Included
  #       # f_utlization_data     
  #       # f_pys_virt_env        
