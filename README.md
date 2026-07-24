@@ -4,7 +4,7 @@
 This Bash script automates the collection of critical system, network, hardware, and application data from Linux servers. It is designed to assist in migration planning by generating a comprehensive, categorized inventory of the server's current state.
 
 **Author:** Team L1  
-*(Navdeep (Captain), Rohit Varshney, Ashok Kumar, Yogendra Modak, Gaurav Kumar, Godishala Rajkumar, Ishan Doye)*
+*(Ishan (Captain), Navdeep )*
 
 ## 🚀 Features
 The script executes a series of modular functions to gather and export data into a specified directory. Key details collected include:
