@@ -1,0 +1,596 @@
+#!/bin/bash
+#
+# PHP PRE-CHANGE ASSESSMENT
+# Target: RHEL 7.9 / PHP 5.4 / Apache Event MPM / PHP-FPM
+#
+# Read-only assessment.
+# Does not modify PHP, Apache, or application configuration.
+#
+# Run as root for maximum visibility.
+#
+
+set -u
+umask 077
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+OUTDIR="/root/php_assessment_${TIMESTAMP}"
+REPORT="${OUTDIR}/assessment.txt"
+
+mkdir -p "$OUTDIR" || exit 1
+touch "$REPORT" || exit 1
+
+exec > >(tee -a "$REPORT") 2>&1
+
+section() {
+    printf '\n'
+    printf '%s\n' "============================================================"
+    printf '%s\n' "$1"
+    printf '%s\n' "============================================================"
+}
+
+run() {
+    printf '\nCOMMAND:'
+    printf ' %q' "$@"
+    printf '\n'
+
+    "$@" 2>&1 || echo "Command failed or returned no matching data."
+}
+
+section "ASSESSMENT INFORMATION"
+
+echo "Date: $(date)"
+echo "Hostname: $(hostname)"
+echo "User: $(id -un)"
+echo "Report directory: $OUTDIR"
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "WARNING: Not running as root. Some information may be unavailable."
+fi
+
+
+section "1. OPERATING SYSTEM"
+
+run cat /etc/redhat-release
+run uname -a
+run uptime
+run getenforce
+
+
+section "2. PHP VERSION AND INSTALLED PACKAGES"
+
+if command -v php >/dev/null 2>&1; then
+    run php -v
+    run php --ini
+    run php -r 'echo "PHP_VERSION=", PHP_VERSION, "\n";'
+else
+    echo "PHP CLI binary not found."
+fi
+
+echo
+echo "Installed PHP RPM packages:"
+
+rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' |
+grep -Ei '(^php|^ea-php|^plesk-php)' |
+sort || true
+
+echo
+echo "PHP package vendor and installation details:"
+
+rpm -qa --qf '%{NAME}\n' |
+grep -Ei '^(php|ea-php|plesk-php)' |
+while IFS= read -r pkg; do
+    rpm -q --qf \
+    '%{NAME} | %{VERSION}-%{RELEASE} | %{VENDOR} | %{INSTALLTIME:date}\n' \
+    "$pkg"
+done
+
+
+section "3. PHP CLI CONFIGURATION"
+
+if command -v php >/dev/null 2>&1; then
+
+    php -r '
+    $keys = array(
+        "memory_limit",
+        "post_max_size",
+        "upload_max_filesize",
+        "max_file_uploads",
+        "max_input_vars",
+        "max_input_nesting_level",
+        "max_execution_time",
+        "max_input_time",
+        "session.upload_progress.enabled",
+        "session.upload_progress.cleanup",
+        "session.upload_progress.freq",
+        "fatal_error_backtraces",
+        "log_errors",
+        "display_errors"
+    );
+
+    foreach ($keys as $key) {
+        $value = ini_get($key);
+
+        if ($value === false) {
+            $value = "NOT AVAILABLE";
+        }
+
+        echo $key, " = ", $value, PHP_EOL;
+    }
+    '
+fi
+
+echo
+echo "NOTE: CLI configuration may differ from Apache/PHP-FPM."
+
+
+section "4. PHP CONFIGURATION FILES"
+
+for path in \
+    /etc/php.ini \
+    /etc/php.d \
+    /etc/php-fpm.conf \
+    /etc/php-fpm.d
+do
+    if [ -e "$path" ]; then
+        ls -ld "$path"
+    fi
+done
+
+echo
+echo "Relevant PHP configuration directives:"
+
+for path in /etc/php.ini /etc/php.d /etc/php-fpm.d; do
+
+    if [ -d "$path" ]; then
+
+        grep -RhnE \
+        '^[[:space:]]*(memory_limit|post_max_size|upload_max_filesize|max_file_uploads|max_input_vars|max_input_nesting_level|session\.upload_progress\.enabled|fatal_error_backtraces)[[:space:]]*=' \
+        "$path" 2>/dev/null || true
+
+    elif [ -f "$path" ]; then
+
+        grep -hnE \
+        '^[[:space:]]*(memory_limit|post_max_size|upload_max_filesize|max_file_uploads|max_input_vars|max_input_nesting_level|session\.upload_progress\.enabled|fatal_error_backtraces)[[:space:]]*=' \
+        "$path" 2>/dev/null || true
+    fi
+done
+
+
+section "5. PHP-FPM CONFIGURATION FILE INVENTORY"
+
+if [ -d /etc/php-fpm.d ]; then
+
+    find /etc/php-fpm.d \
+        -maxdepth 1 \
+        -type f \
+        -name '*.conf' \
+        -print |
+    sort
+
+else
+    echo "PHP-FPM pool directory not found."
+fi
+
+
+section "6. PHP-FPM POOL CONFIGURATION"
+
+echo "Collecting selected pool directives."
+echo "Passwords, environment variables and complete files are excluded."
+
+if [ -d /etc/php-fpm.d ]; then
+
+    find /etc/php-fpm.d \
+        -maxdepth 1 \
+        -type f \
+        -name '*.conf' \
+        -print0 |
+    sort -z |
+    while IFS= read -r -d '' file; do
+
+        echo
+        echo "--------------------------------------------------"
+        echo "POOL CONFIGURATION: $file"
+        echo "--------------------------------------------------"
+
+        awk '
+        /^[[:space:]]*[;#]/ {next}
+
+        /^[[:space:]]*\[[^]]+\]/ {
+            print
+            next
+        }
+
+        /^[[:space:]]*(pm|pm\.max_children|pm\.start_servers|pm\.min_spare_servers|pm\.max_spare_servers|pm\.max_requests|pm\.process_idle_timeout|request_terminate_timeout|request_slowlog_timeout)[[:space:]]*=/ {
+            print
+            next
+        }
+
+        /^[[:space:]]*php_(admin_)?value\[(memory_limit|post_max_size|upload_max_filesize|session\.upload_progress\.enabled|fatal_error_backtraces)\][[:space:]]*=/ {
+            print
+            next
+        }
+
+        /^[[:space:]]*php_(admin_)?flag\[(session\.upload_progress\.enabled)\][[:space:]]*=/ {
+            print
+            next
+        }
+        ' "$file"
+
+    done
+fi
+
+
+section "7. PHP-FPM SERVICE STATUS"
+
+for service in php-fpm.service php-fpm; do
+
+    if systemctl list-unit-files "$service" 2>/dev/null |
+       grep -q '^php-fpm'; then
+
+        run systemctl is-active "$service"
+
+        run systemctl show "$service" \
+            -p MainPID \
+            -p TasksCurrent \
+            -p TasksMax \
+            -p MemoryCurrent \
+            -p MemoryLimit \
+            -p LimitAS \
+            -p LimitDATA \
+            -p LimitNOFILE
+
+        break
+    fi
+done
+
+
+section "8. PHP-FPM PROCESS DETAILS"
+
+ps -eo pid,ppid,user,%cpu,%mem,rss,vsz,etime,args |
+grep '[p]hp-fpm' || true
+
+echo
+echo "Total PHP-FPM processes:"
+
+ps -eo args |
+grep -c '[p]hp-fpm' || true
+
+
+section "9. PHP-FPM MEMORY SUMMARY"
+
+ps -eo rss=,args= |
+awk '
+/php-fpm/ && !/awk/ {
+    count++
+    total += $1
+
+    if ($1 > max) {
+        max = $1
+    }
+}
+END {
+    printf "PHP-FPM processes: %d\n", count
+    printf "Combined RSS: %.2f MB\n", total/1024
+    printf "Average RSS: %.2f MB\n", count ? total/count/1024 : 0
+    printf "Maximum RSS: %.2f MB\n", max/1024
+}
+'
+
+echo
+echo "NOTE: Summed RSS includes shared memory and is not"
+echo "equivalent to unique physical memory consumption."
+
+
+section "10. PHP-FPM MEMORY BY POOL"
+
+ps -eo rss=,args= |
+awk '
+/php-fpm: pool / {
+    pool=$0
+    sub(/^.*php-fpm: pool /, "", pool)
+
+    count[pool]++
+    rss[pool]+=$1
+
+    if ($1 > max[pool]) {
+        max[pool]=$1
+    }
+}
+END {
+    printf "%-30s %10s %15s %15s\n", \
+    "POOL", "WORKERS", "RSS_MB", "MAX_RSS_MB"
+
+    for (pool in count) {
+        printf "%-30s %10d %15.2f %15.2f\n", \
+        pool, count[pool], rss[pool]/1024, max[pool]/1024
+    }
+}
+'
+
+
+section "11. APACHE CONFIGURATION"
+
+if command -v httpd >/dev/null 2>&1; then
+
+    run httpd -v
+
+    echo
+    echo "Apache MPM:"
+
+    httpd -V 2>&1 |
+    grep -Ei 'Server MPM|HTTPD_ROOT|SERVER_CONFIG_FILE' || true
+
+    echo
+    echo "Loaded PHP and proxy modules:"
+
+    httpd -M 2>&1 |
+    grep -Ei 'php|proxy_fcgi|mpm_' || true
+
+fi
+
+echo
+echo "Apache process information:"
+
+ps -eo pid,ppid,user,%cpu,%mem,rss,args |
+grep '[h]ttpd' || true
+
+
+section "12. APACHE REQUEST LIMITS"
+
+if [ -d /etc/httpd ]; then
+
+    grep -RnE \
+    '^[[:space:]]*(LimitRequestBody|LimitRequestFields|LimitRequestFieldSize|LimitRequestLine)[[:space:]]+' \
+    /etc/httpd/conf \
+    /etc/httpd/conf.d \
+    2>/dev/null || true
+
+fi
+
+
+section "13. APACHE PHP-FPM HANDLER REFERENCES"
+
+echo "Searching for PHP-FPM handler directives."
+
+if [ -d /etc/httpd ]; then
+
+    grep -RnEi \
+    '^[[:space:]]*(SetHandler|ProxyPassMatch|AddHandler|AddType)[[:space:]]+' \
+    /etc/httpd/conf \
+    /etc/httpd/conf.d \
+    2>/dev/null |
+    grep -Ei 'php|fcgi|proxy' |
+    sed -E \
+    's#(unix:)[^|[:space:]]+#\1[SOCKET_REDACTED]#g;
+     s#(fcgi://)[^/[:space:]]+#\1[ENDPOINT_REDACTED]#g' \
+    || true
+
+fi
+
+
+section "14. SYSTEM MEMORY"
+
+run free -h
+
+echo
+echo "Selected memory information:"
+
+grep -E \
+'^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|Dirty|Writeback|Committed_AS|CommitLimit|Slab):' \
+/proc/meminfo
+
+
+section "15. CPU INFORMATION"
+
+run lscpu
+run uptime
+
+echo
+echo "CPU count:"
+
+run nproc
+
+
+section "16. TOP MEMORY CONSUMERS"
+
+ps -eo pid,ppid,user,%cpu,%mem,rss,comm --sort=-rss |
+head -25
+
+
+section "17. TOP CPU CONSUMERS"
+
+ps -eo pid,ppid,user,%cpu,%mem,rss,comm --sort=-%cpu |
+head -25
+
+
+section "18. HISTORICAL CPU AND MEMORY"
+
+if command -v sar >/dev/null 2>&1; then
+
+    echo
+    echo "CPU history:"
+    sar -u 2>&1 || true
+
+    echo
+    echo "Memory history:"
+    sar -r 2>&1 || true
+
+    echo
+    echo "Swap history:"
+    sar -S 2>&1 || true
+
+    echo
+    echo "Process creation history:"
+    sar -w 2>&1 || true
+
+else
+    echo "sysstat/sar not installed."
+fi
+
+
+section "19. OOM AND MEMORY FAILURE EVENTS"
+
+echo "Selected kernel messages from the last seven days."
+
+journalctl -k --since "7 days ago" \
+    --no-pager -o cat 2>/dev/null |
+grep -Ei \
+'out of memory|oom-killer|oom-kill|memory cgroup|page allocation failure' |
+sed -E \
+'s#(/[[:alnum:]_.-]+)+#[PATH_REDACTED]#g' |
+tail -100 || true
+
+
+section "20. PHP-FPM ERROR INDICATORS"
+
+echo "Selected PHP-FPM service messages from the last 24 hours."
+
+journalctl -u php-fpm.service \
+    --since "24 hours ago" \
+    --no-pager -o cat 2>/dev/null |
+grep -Ei \
+'child.*exited|segmentation fault|signal 11|out of memory|server reached pm.max_children|failed to fork|emergency restart' |
+sed -E \
+'s#(/[[:alnum:]_.-]+)+#[PATH_REDACTED]#g' |
+tail -100 || true
+
+
+section "21. PHP-FPM PROCESS LIMITS"
+
+FPM_PID=$(pgrep -o -x php-fpm 2>/dev/null || true)
+
+if [ -n "$FPM_PID" ]; then
+
+    echo "PHP-FPM PID: $FPM_PID"
+
+    echo
+    echo "Process limits:"
+
+    cat "/proc/$FPM_PID/limits" 2>/dev/null || true
+
+    echo
+    echo "Cgroup membership:"
+
+    cat "/proc/$FPM_PID/cgroup" 2>/dev/null || true
+
+else
+    echo "PHP-FPM master process not identified."
+fi
+
+
+section "22. APPLICATION UPLOAD-PROGRESS REFERENCES"
+
+echo "Checking common application directories."
+echo "Only matching file counts are collected."
+echo "No source code is copied."
+
+for path in /var/www/html /var/www/vhosts; do
+
+    if [ -d "$path" ]; then
+
+        count=$(grep -Rl \
+            --include='*.php' \
+            --include='*.html' \
+            --include='*.js' \
+            'PHP_SESSION_UPLOAD_PROGRESS' \
+            "$path" 2>/dev/null |
+            wc -l)
+
+        echo "$path : $count matching files"
+
+    fi
+done
+
+echo
+echo "NOTE: No matches do not prove the feature is unused."
+
+
+section "23. FILE DESCRIPTOR LIMITS"
+
+echo "System-wide file descriptor limits:"
+
+cat /proc/sys/fs/file-max
+cat /proc/sys/fs/file-nr
+
+if [ -n "$FPM_PID" ]; then
+
+    grep -i 'open files' \
+    "/proc/$FPM_PID/limits" 2>/dev/null || true
+
+fi
+
+
+section "24. SECURITY CONTEXT"
+
+echo "SELinux status:"
+
+getenforce 2>/dev/null || true
+
+echo
+echo "PHP RPM signature information:"
+
+rpm -qa --qf '%{NAME}\n' |
+grep -Ei '^(php|ea-php|plesk-php)' |
+while IFS= read -r pkg; do
+
+    rpm -q --qf \
+    '%{NAME} | %{SIGPGP:pgpsig}\n' \
+    "$pkg" 2>/dev/null
+
+done
+
+
+section "25. ASSESSMENT LIMITATIONS"
+
+cat <<'EOF'
+
+1. PHP CLI settings may differ from PHP-FPM settings.
+
+2. Configuration directives may be overridden by pool,
+   virtual-host, directory, or application configuration.
+
+3. The script does not determine actual application upload
+   requirements or maximum legitimate POST request sizes.
+
+4. PHP-FPM RSS includes shared memory and cannot be treated
+   as exact unique physical memory consumption.
+
+5. Resource statistics are point-in-time measurements unless
+   historical sysstat data is available.
+
+6. PHP-FPM worker recycling overhead requires representative
+   workload testing.
+
+7. Installed PHP package versions alone do not establish
+   whether security fixes have been backported.
+
+8. No source files, complete configuration files, or raw
+   access logs are collected.
+
+9. PHP-FPM pool settings are collected from the standard
+   /etc/php-fpm.d directory. Additional include paths or
+   nonstandard PHP installations may require manual review.
+
+10. Sensitive identifiers may still appear in diagnostic
+    output. Review the report before sharing.
+
+EOF
+
+
+section "ASSESSMENT COMPLETE"
+
+echo "Report: $REPORT"
+
+ARCHIVE="/root/php_assessment_${TIMESTAMP}.tar.gz"
+
+tar -czf "$ARCHIVE" \
+    -C /root \
+    "$(basename "$OUTDIR")"
+
+chmod 600 "$ARCHIVE"
+
+echo
+echo "Archive created: $ARCHIVE"
+echo
+echo "IMPORTANT: Review and redact sensitive information"
+echo "before sharing the archive."
